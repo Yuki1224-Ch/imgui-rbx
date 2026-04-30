@@ -85,17 +85,20 @@ Check `examples` on how to use each feature.
 A powerful debugging module featuring:
 - **Upvalue Finder**: Inspect and modify function upvalues in real-time
 - **Function Spy**: Track function execution and detect upvalue changes
+- **Deep Search**: Lag-free search through all upvalues and nested tables
 - **Live Stats**: Monitor memory usage, change counts, and recent modifications
 - **Code Generation**: Auto-generate code snippets for upvalue modifications
 - **Clipboard Support**: Copy generated code directly to clipboard
 
 ## Features
 
-### Upvalue Finder
+### Upvalue Finder with Deep Search
 - View all upvalues of any function with type information
+- **Deep search** through nested tables inside upvalues
 - Edit upvalues in real-time with immediate effect
 - Filter and search through tracked functions
 - Automatic change detection with history tracking
+- **Optimized caching** for lag-free performance
 
 ### Function Spy
 - Track multiple functions simultaneously
@@ -108,6 +111,7 @@ A powerful debugging module featuring:
 - Total changes detected across all functions
 - Memory usage monitoring
 - Recent changes list with details
+- Search performance metrics
 
 ### Code Generation
 - Generate ready-to-use code snippets for upvalue modification
@@ -122,6 +126,11 @@ A powerful debugging module featuring:
 local DebugTools = require(script.Parent.debug_tools)
 local debugger = setmetatable({}, DebugTools)
 
+-- Configure for optimal performance (no lag)
+debugger.Config.MaxDepth = 8 -- Limit recursion depth
+debugger.Config.SearchBufferSize = 500 -- Limit results
+debugger.Config.CacheResults = true -- Enable caching
+
 -- Track a function
 debugger:TrackFunction(yourFunction, "myFunction")
 
@@ -134,6 +143,20 @@ for _, upvalue in ipairs(upvalues) do
         upvalue.stringValue
     ))
 end
+
+-- Deep search for specific values
+local results = debugger:DeepSearchUpvalues(yourFunction, "searchTerm")
+for _, result in ipairs(results) do
+    print("Found:", result.matchType, result.upvalue.name)
+end
+
+-- Search all tracked functions
+local allResults, stats = debugger:SearchAllFunctions("keyword", {
+    maxResults = 50,
+    includeNested = true
+})
+print(string.format("Found %d results in %.4fs", 
+    stats.totalResults, stats.totalTime))
 
 -- Modify an upvalue
 debugger:SetUpvalue(yourFunction, 1, newValue)
@@ -149,6 +172,13 @@ debugger:CopyToClipboard(code)
 local stats = debugger:GetLiveStats()
 print("Tracked:", stats.totalTracked)
 print("Changes:", stats.totalChanges)
+
+-- Get search performance stats
+local searchStats = debugger:GetSearchStats()
+print("Last search time:", searchStats.lastSearchTime)
+
+-- Clear caches if needed
+debugger:ClearCaches()
 ```
 
 ## Integration with ImGui-RBX
@@ -161,10 +191,60 @@ local DebugTools = require(script.Parent.debug_tools)
 local debugger = setmetatable({}, DebugTools)
 
 -- Create your ImGui window
-local handler = ImGui:Begin({Name = "Debug Tools", Width = 700, Height = 500})
+local handler = ImGui:Begin({Name = "Debug Tools", Width = 800, Height = 600})
 
 -- Display stats
-handler:Text("Tracked Functions: " .. debugger:GetLiveStats().totalTracked)
+local stats = debugger:GetLiveStats()
+local searchStats = debugger:GetSearchStats()
+handler:Text("Tracked Functions: " .. stats.totalTracked)
+handler:Text("Last Search: " .. searchStats.lastSearchTime .. "s")
+
+-- Deep Search Section
+handler:TextColored(1, 1, 0, 1, "Deep Search (Lag-Free)")
+local changed, query = handler:InputText("##Search", debugger.uiData.deepSearchQuery or "", 256)
+if changed then
+    debugger:setDeepSearchQuery(query)
+end
+
+if handler:Button("Search") then
+    local results, perfStats = debugger:SearchAllFunctions(query, {
+        maxResults = 50,
+        includeNested = true
+    })
+    print("Found", perfStats.totalResults, "in", perfStats.totalTime, "s")
+end
+
+-- Display search results
+for i, result in ipairs(debugger.uiData.deepSearchResults) do
+    local displayText = string.format("%s [%s] = %s",
+        result.upvalue.name,
+        result.upvalue.valueType,
+        result.upvalue.stringValue
+    )
+    handler:Text(displayText)
+    
+    if handler:Button("Edit##" .. i) then
+        debugger:setSelectedFunction(result.func)
+        debugger:setSelectedUpvalue(result.upvalue)
+    end
+end
+
+-- Edit Selected Upvalue
+if debugger.uiData.selectedUpvalue then
+    handler:Text("Editing: " .. debugger.uiData.selectedUpvalue.name)
+    local changed, newValue = handler:InputText("##Edit", 
+        debugger.uiData.editValue or "", 512)
+    if changed then
+        debugger:setEditValue(newValue)
+    end
+    
+    if handler:Button("Apply Changes") then
+        local success, err = debugger:applyEdit()
+        if success then
+            print("Updated!")
+        end
+    end
+end
 
 -- List tracked functions with edit buttons
 for func, data in pairs(debugger.TrackedFunctions) do
@@ -173,12 +253,13 @@ for func, data in pairs(debugger.TrackedFunctions) do
     -- Show upvalues
     local upvalues = debugger:GetUpvalues(func)
     for _, uv in ipairs(upvalues) do
-        handler:Text(string.format("  %s: %s", uv.name, uv.stringValue))
+        local hasNested = type(uv.value) == "table" and "🔍" or ""
+        handler:Text(string.format("  %s%s: %s", hasNested, uv.name, uv.stringValue))
     end
     
     -- Edit button
     if handler:Button("Edit##" .. data.name) then
-        -- Open edit dialog
+        debugger:setSelectedFunction(func)
     end
     
     -- Generate code button
@@ -186,6 +267,18 @@ for func, data in pairs(debugger.TrackedFunctions) do
         local code = debugger:GenerateUpvalueCode(func, data.name)
         debugger:CopyToClipboard(code)
     end
+    
+    -- Deep search this function
+    if handler:Button("Deep Search##" .. data.name) then
+        local results = debugger:DeepSearchUpvalues(func, "")
+        print("Found", #results, "matches")
+    end
+end
+
+-- Performance controls
+if handler:Button("Clear Caches") then
+    debugger:ClearCaches()
+    print("Caches cleared!")
 end
 ```
 
@@ -195,10 +288,16 @@ See `examples/debug_tools_example.lua` for complete usage examples.
 
 ### Core Functions
 - `debugger:TrackFunction(func, name)` - Start tracking a function
-- `debugger:GetUpvalues(func)` - Get all upvalues from a function
+- `debugger:GetUpvalues(func, useCache)` - Get all upvalues from a function
 - `debugger:SetUpvalue(func, index, newValue)` - Modify an upvalue
 - `debugger:CheckTrackedFunctions()` - Check for changes in tracked functions
 - `debugger:GetFunctionInfo(func)` - Get detailed function information
+
+### Deep Search Functions
+- `debugger:DeepSearchUpvalues(func, searchQuery)` - Search within a function's upvalues
+- `debugger:SearchAllFunctions(searchQuery, options)` - Search across all tracked functions
+- `debugger:GetSearchStats()` - Get search performance statistics
+- `debugger:ClearCaches()` - Clear all cached data
 
 ### Utility Functions
 - `debugger:GenerateUpvalueCode(func, name)` - Generate modification code
@@ -212,8 +311,23 @@ DebugTools.Config = {
     AutoRefresh = true,        -- Auto-check for changes
     RefreshRate = 0.5,         -- Check interval in seconds
     ShowNilUpvalues = false,   -- Show nil upvalues
-    MaxUpvaluesDisplay = 50,   -- Maximum upvalues to display
+    MaxUpvaluesDisplay = 100,  -- Maximum upvalues to display
     EnableFunctionHooking = true,
-    ShowBytecodeInfo = false
+    ShowBytecodeInfo = false,
+    DeepSearchEnabled = true,  -- Enable deep search in nested tables
+    MaxDepth = 10,             -- Maximum recursion depth for deep search
+    CacheResults = true,       -- Cache upvalue results for performance
+    LazyLoading = true,        -- Load results on demand
+    SearchBufferSize = 1000    -- Maximum search results to return
 }
 ```
+
+### UI Helper Methods
+When using `CreateUI`, you get access to:
+- `setDeepSearchQuery(query)` - Set and execute deep search
+- `setSelectedFunction(func)` - Select a function for editing
+- `setSelectedUpvalue(upvalue)` - Select an upvalue for editing
+- `setEditValue(value)` - Set the edit value
+- `applyEdit()` - Apply the edited value to the selected upvalue
+- `toggleDeepSearch()` - Toggle deep search panel visibility
+- `performDeepSearch(query)` - Execute a deep search

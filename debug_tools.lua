@@ -1,5 +1,5 @@
 -- Debug Tools Module for imgui-rbx
--- Features: Upvalue Finder, Function Spy, Live Stats, Code Generation
+-- Features: Upvalue Finder, Function Spy, Live Stats, Code Generation, Deep Search
 
 local DebugTools = {}
 DebugTools.__index = DebugTools
@@ -9,9 +9,14 @@ DebugTools.Config = {
     AutoRefresh = true,
     RefreshRate = 0.5, -- seconds
     ShowNilUpvalues = false,
-    MaxUpvaluesDisplay = 50,
+    MaxUpvaluesDisplay = 100,
     EnableFunctionHooking = true,
-    ShowBytecodeInfo = false
+    ShowBytecodeInfo = false,
+    DeepSearchEnabled = true,
+    MaxDepth = 10,
+    CacheResults = true,
+    LazyLoading = true,
+    SearchBufferSize = 1000
 }
 
 -- Storage for tracked functions
@@ -19,9 +24,12 @@ DebugTools.TrackedFunctions = {}
 DebugTools.FunctionHistory = {}
 DebugTools.UpvalueCache = {}
 DebugTools.StatsHistory = {}
+DebugTools.SearchCache = {}
+DebugTools.LastSearchTime = 0
 
 -- Utility functions
 local function secureToString(value)
+    if value == nil then return "nil" end
     local success, result = pcall(tostring, value)
     if success then
         return result
@@ -39,9 +47,6 @@ local function getValueType(value)
     elseif t == "function" then
         return "function"
     elseif t == "userdata" then
-        if getgenv and getgenv().isinstance then
-            -- Roblox instance check
-        end
         return "userdata"
     elseif t == "number" then
         if math.floor(value) == value then
@@ -69,10 +74,75 @@ local function truncateString(str, maxLen)
     return str
 end
 
--- Get upvalues from a function
-function DebugTools:GetUpvalues(func)
+-- Optimized cache management
+local function clearOldCache()
+    local currentTime = tick()
+    for key, data in pairs(DebugTools.SearchCache) do
+        if currentTime - data.timestamp > 60 then -- Clear cache older than 1 minute
+            DebugTools.SearchCache[key] = nil
+        end
+    end
+end
+
+-- Deep search through table contents
+local function deepSearchTable(tbl, searchQuery, currentPath, depth, results, visited)
+    if depth > DebugTools.Config.MaxDepth or visited[tbl] then
+        return
+    end
+    visited[tbl] = true
+    
+    for key, value in pairs(tbl) do
+        local newPath = currentPath and (currentPath .. "." .. tostring(key)) or tostring(key)
+        
+        -- Check if key or value matches search
+        local keyStr = tostring(key)
+        local valueStr = secureToString(value)
+        local matches = false
+        
+        if searchQuery == "" or 
+           string.find(string.lower(keyStr), string.lower(searchQuery)) or
+           string.find(string.lower(valueStr), string.lower(searchQuery)) then
+            matches = true
+        end
+        
+        if matches then
+            table.insert(results, {
+                path = newPath,
+                key = key,
+                value = value,
+                valueType = getValueType(value),
+                displayValue = valueStr,
+                depth = depth,
+                isTable = type(value) == "table"
+            })
+            
+            if #results >= DebugTools.Config.SearchBufferSize then
+                return -- Stop if buffer is full
+            end
+        end
+        
+        -- Recursively search nested tables
+        if type(value) == "table" and DebugTools.Config.DeepSearchEnabled then
+            deepSearchTable(value, searchQuery, newPath, depth + 1, results, visited)
+        end
+    end
+end
+
+-- Get upvalues from a function with caching for performance
+function DebugTools:GetUpvalues(func, useCache)
     if type(func) ~= "function" then
         return {}, "Not a function"
+    end
+    
+    -- Use cache if enabled and available
+    if useCache ~= false and self.Config.CacheResults then
+        local cacheKey = tostring(func)
+        if self.UpvalueCache[cacheKey] then
+            local cached = self.UpvalueCache[cacheKey]
+            if tick() - cached.timestamp < 1.0 then -- Cache valid for 1 second
+                return cached.upvalues
+            end
+        end
     end
     
     local upvalues = {}
@@ -88,7 +158,8 @@ function DebugTools:GetUpvalues(func)
             name = name,
             value = value,
             valueType = getValueType(value),
-            stringValue = secureToString(value)
+            stringValue = secureToString(value),
+            realValue = value -- Store actual value for deep inspection
         })
         
         if i >= self.Config.MaxUpvaluesDisplay then
@@ -97,7 +168,128 @@ function DebugTools:GetUpvalues(func)
         i = i + 1
     end
     
+    -- Cache the result
+    if self.Config.CacheResults then
+        local cacheKey = tostring(func)
+        self.UpvalueCache[cacheKey] = {
+            upvalues = upvalues,
+            timestamp = tick()
+        }
+    end
+    
     return upvalues
+end
+
+-- Deep search upvalues for specific values
+function DebugTools:DeepSearchUpvalues(func, searchQuery)
+    if type(func) ~= "function" then
+        return {}, "Not a function"
+    end
+    
+    clearOldCache() -- Clean old cache entries
+    
+    local upvalues = self:GetUpvalues(func, false) -- Bypass cache for fresh data
+    local results = {}
+    
+    for _, upvalue in ipairs(upvalues) do
+        local nameMatch = string.find(string.lower(upvalue.name), string.lower(searchQuery))
+        local valueMatch = string.find(string.lower(upvalue.stringValue), string.lower(searchQuery))
+        
+        if nameMatch or valueMatch then
+            table.insert(results, {
+                upvalue = upvalue,
+                matchType = nameMatch and valueMatch and "both" or (nameMatch and "name" or "value"),
+                depth = 0
+            })
+            
+            -- Deep search if value is a table
+            if type(upvalue.value) == "table" and DebugTools.Config.DeepSearchEnabled then
+                local visited = {}
+                local nestedResults = {}
+                deepSearchTable(upvalue.value, searchQuery, upvalue.name, 1, nestedResults, visited)
+                
+                for _, nested in ipairs(nestedResults) do
+                    table.insert(results, {
+                        upvalue = upvalue,
+                        nestedPath = nested.path,
+                        nestedValue = nested.value,
+                        nestedValueType = nested.valueType,
+                        nestedDisplayValue = nested.displayValue,
+                        matchType = "nested",
+                        depth = nested.depth
+                    })
+                end
+            end
+        end
+    end
+    
+    return results
+end
+
+-- Search all tracked functions for specific upvalue patterns
+function DebugTools:SearchAllFunctions(searchQuery, options)
+    options = options or {}
+    local maxResults = options.maxResults or 100
+    local includeNested = options.includeNested ~= false
+    
+    clearOldCache()
+    
+    local startTime = tick()
+    local results = {}
+    local visited = {}
+    
+    for func, data in pairs(self.TrackedFunctions) do
+        if #results >= maxResults then
+            break
+        end
+        
+        local upvalues = self:GetUpvalues(func, false)
+        
+        for _, upvalue in ipairs(upvalues) do
+            local nameMatch = string.find(string.lower(upvalue.name), string.lower(searchQuery))
+            local valueMatch = string.find(string.lower(upvalue.stringValue), string.lower(searchQuery))
+            
+            if nameMatch or valueMatch then
+                table.insert(results, {
+                    functionName = data.name,
+                    func = func,
+                    upvalue = upvalue,
+                    matchType = nameMatch and valueMatch and "both" or (nameMatch and "name" or "value")
+                })
+            end
+            
+            -- Deep search nested tables
+            if includeNested and type(upvalue.value) == "table" then
+                local nestedResults = {}
+                deepSearchTable(upvalue.value, searchQuery, upvalue.name, 1, nestedResults, visited)
+                
+                for _, nested in ipairs(nestedResults) do
+                    if #results >= maxResults then
+                        break
+                    end
+                    table.insert(results, {
+                        functionName = data.name,
+                        func = func,
+                        upvalue = upvalue,
+                        nestedPath = nested.path,
+                        nestedValue = nested.value,
+                        nestedValueType = nested.valueType,
+                        nestedDisplayValue = nested.displayValue,
+                        matchType = "nested",
+                        depth = nested.depth
+                    })
+                end
+            end
+        end
+    end
+    
+    self.LastSearchTime = tick() - startTime
+    
+    return results, {
+        totalTime = self.LastSearchTime,
+        totalResults = #results,
+        cacheSize = #self.SearchCache
+    }
 end
 
 -- Set upvalue for a function
@@ -354,7 +546,7 @@ function DebugTools:FindFunctionsInTable(tbl, path)
     return found
 end
 
--- Create UI panel for DebugTools
+-- Create UI panel for DebugTools with deep search
 function DebugTools:CreateUI(parent, elementHandler)
     if not parent or not elementHandler then
         return nil, "Invalid parent or elementHandler"
@@ -363,14 +555,35 @@ function DebugTools:CreateUI(parent, elementHandler)
     local uiData = {
         selectedFunction = nil,
         searchQuery = "",
+        deepSearchQuery = "",
         showChangesOnly = false,
-        autoRefreshEnabled = true
+        autoRefreshEnabled = true,
+        deepSearchResults = {},
+        showDeepSearch = false,
+        selectedUpvalue = nil,
+        editValue = ""
     }
     
     -- Helper to refresh the UI
     local function refreshUI()
         -- This would be called periodically when auto-refresh is enabled
         return self:CheckTrackedFunctions()
+    end
+    
+    -- Perform deep search
+    local function performDeepSearch(query)
+        if not query or query == "" then
+            uiData.deepSearchResults = {}
+            return {}
+        end
+        
+        local results, stats = self:SearchAllFunctions(query, {
+            maxResults = 50,
+            includeNested = true
+        })
+        
+        uiData.deepSearchResults = results
+        return results, stats
     end
     
     -- Start auto-refresh loop
@@ -387,6 +600,7 @@ function DebugTools:CreateUI(parent, elementHandler)
         handler = self,
         uiData = uiData,
         refresh = refreshUI,
+        performDeepSearch = performDeepSearch,
         
         -- Methods to interact with UI
         setSelectedFunction = function(func)
@@ -397,14 +611,69 @@ function DebugTools:CreateUI(parent, elementHandler)
             uiData.searchQuery = query
         end,
         
+        setDeepSearchQuery = function(query)
+            uiData.deepSearchQuery = query
+            return performDeepSearch(query)
+        end,
+        
         toggleShowChangesOnly = function()
             uiData.showChangesOnly = not uiData.showChangesOnly
         end,
         
         toggleAutoRefresh = function()
             uiData.autoRefreshEnabled = not uiData.autoRefreshEnabled
+        end,
+        
+        toggleDeepSearch = function()
+            uiData.showDeepSearch = not uiData.showDeepSearch
+        end,
+        
+        setSelectedUpvalue = function(upvalue)
+            uiData.selectedUpvalue = upvalue
+            if upvalue then
+                uiData.editValue = upvalue.stringValue
+            end
+        end,
+        
+        setEditValue = function(value)
+            uiData.editValue = value
+        end,
+        
+        applyEdit = function()
+            if uiData.selectedFunction and uiData.selectedUpvalue then
+                local success, err = self:SetUpvalue(
+                    uiData.selectedFunction,
+                    uiData.selectedUpvalue.index,
+                    uiData.editValue
+                )
+                return success, err
+            end
+            return false, "No function or upvalue selected"
         end
     }
+end
+
+-- Get search performance stats
+function DebugTools:GetSearchStats()
+    return {
+        lastSearchTime = self.LastSearchTime,
+        cacheSize = #self.SearchCache,
+        upvalueCacheSize = 0,
+        trackedFunctions = #self.TrackedFunctions,
+        config = {
+            maxDepth = self.Config.MaxDepth,
+            searchBufferSize = self.Config.SearchBufferSize,
+            cacheEnabled = self.Config.CacheResults,
+            deepSearchEnabled = self.Config.DeepSearchEnabled
+        }
+    }
+end
+
+-- Clear all caches
+function DebugTools:ClearCaches()
+    self.UpvalueCache = {}
+    self.SearchCache = {}
+    collectgarbage("collect")
 end
 
 -- Export for use
